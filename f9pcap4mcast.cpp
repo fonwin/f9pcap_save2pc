@@ -6,21 +6,244 @@
 #include "fon9/Endian.hpp"
 #include "fon9/File.hpp"
 #include "fon9/DefaultThreadPool.hpp"
+#include "fon9/CmdArgs.hpp"
 #include <set>
-
+#include <inttypes.h>
+//--------------------------------------------------------------------------//
 #ifdef fon9_WINDOWS
    #include "fon9/io/win/IocpDgram.hpp"
+   #pragma comment(lib, "ws2_32.lib")
+   namespace fon9 { namespace io {
+   class IocpSocketRecvFrom : public IocpDgramImpl {
+      fon9_NON_COPY_NON_MOVE(IocpSocketRecvFrom);
+      using base = IocpDgramImpl;
+      SocketAddress  RecvFromAddr_;
+      int            RecvFromAddrLen_;
+      char           Padding____[4];
+   protected:
+      void OnIocpSocket_Received(DcQueueList& rxbuf) override;
+   public:
+      using OwnerDevice = DgramT<IocpServiceSP, IocpSocketRecvFrom>;
+      IocpSocketRecvFrom(OwnerDevice* owner, Socket&& so, SocketResult& soRes)
+         : base(reinterpret_cast<base::OwnerDevice*>(owner), std::move(so), soRes) {
+      }
+      const SocketAddress& GetRecvFromAddr() const {
+         return this->RecvFromAddr_;
+      }
+      void StartRecv(RecvBufferSize preallocSize);
+      void ContinueRecv(RecvBufferSize expectSize) {
+         this->StartRecv(expectSize);
+      }
+      struct IocpRecvAux : public base::IocpRecvAux {
+         static void ContinueRecv(RecvBuffer& rbuf, RecvBufferSize expectSize, bool isEnableReadable) {
+            (void)isEnableReadable;
+            IocpSocket& rbase = ContainerOf(rbuf, &IocpSocket::RecvBuffer_);
+            static_cast<IocpSocketRecvFrom*>(&rbase)->ContinueRecv(expectSize);
+         }
+         static SendDirectResult SendDirect(RecvDirectArgs& e, BufferList&& txbuf) {
+            // 不支援傳送.
+            (void)e; (void)txbuf;
+            return SendDirectResult::SendError;
+         }
+      };
+   };
+   using IocpDgramRecvFromBase = DeviceImpl_DeviceStartSend<IocpSocketRecvFrom::OwnerDevice, IocpSocketRecvFrom>;
+
+   class IocpDgramRecvFrom : public IocpDgramRecvFromBase {
+      fon9_NON_COPY_NON_MOVE(IocpDgramRecvFrom);
+      using base = IocpDgramRecvFromBase;
+   public:
+      using base::base;
+      const SocketAddress& GetRecvFromAddr() const {
+         return this->ImplSP_->GetRecvFromAddr();
+      }
+   };
+   //--------------------------------------------------------------------------//
+   void IocpSocketRecvFrom::OnIocpSocket_Received(DcQueueList& rxbuf) {
+      if (fon9_LIKELY(this->State_ >= State::Connecting)) {
+         struct RecvAux : public IocpRecvAux {
+            static bool IsRecvBufferAlive(Device& dev, RecvBuffer& rbuf) {
+               return OwnerDevice::OpImpl_IsRecvBufferAlive(*static_cast<OwnerDevice*>(&dev), rbuf);
+            }
+         };
+         RecvAux aux;
+         DeviceRecvBufferReady(*this->Owner_, rxbuf, aux);
+      }
+      else {
+         rxbuf.PopConsumedAll();
+      }
+   }
+   void IocpSocketRecvFrom::StartRecv(RecvBufferSize expectSize) {
+      WSABUF bufv[2];
+      size_t bufCount;
+      if (fon9_UNLIKELY(expectSize < RecvBufferSize::Default)) {
+         // 不理會資料事件: Session預期不會有資料.
+         // RecvBufferSize::NoRecvEvent, CloseRecv; //還是需要使用[接收事件]偵測斷線.
+         bufv[0].len = 0;
+         bufv[0].buf = nullptr;
+         bufCount = 1;
+      }
+      else {
+         if (expectSize == RecvBufferSize::Default) // 接收緩衝區預設大小.
+            expectSize = static_cast<RecvBufferSize>(1024 * 4);
+         const size_t allocSize = static_cast<size_t>(expectSize);
+         bufCount = this->RecvBuffer_.GetRecvBlockVector(bufv, allocSize >= 64 ? allocSize : (allocSize * 2));
+      }
+      // 啟動 WSARecv();
+      DWORD rxBytes, flags = 0;
+      ZeroStruct(this->RecvOverlapped_);
+      this->IocpSocketAddRef();
+      this->RecvFromAddrLen_ = sizeof(this->RecvFromAddr_.Addr_);
+      if (WSARecvFrom(this->Socket_.GetSocketHandle(), bufv, static_cast<DWORD>(bufCount), &rxBytes, &flags,
+                      &this->RecvFromAddr_.Addr_, &this->RecvFromAddrLen_,
+                      &this->RecvOverlapped_, nullptr) == SOCKET_ERROR) {
+         switch (int eno = WSAGetLastError()) {
+         case WSA_IO_PENDING: // ERROR_IO_PENDING: 正常接收等候中.
+            break;
+         case WSAEINVAL: // dgram + NoRecvEvent: 本來就預計不會有 Recv 事件.
+            if (expectSize == RecvBufferSize::NoRecvEvent) {
+               this->IocpSocketReleaseRef();
+               return;
+            }
+         default: // 接收失敗, 不會產生 OnIocp_* 事件
+            this->RecvBuffer_.Clear();
+            this->OnIocp_Error(&this->RecvOverlapped_, static_cast<DWORD>(eno));
+         }
+      }
+      else {
+         // 已收到(或已從RCVBUF複製進來), 但仍會觸發 OnIocp_Done() 事件,
+         // 所以一律在 OnIocp_Done() 事件裡面處理即可.
+      }
+   }
+   } } // namespaces
+
+   using RecvDevice = fon9::io::IocpDgramRecvFrom;
    using IoService = fon9::io::IocpService;
    using IoServiceSP = fon9::io::IocpServiceSP;
-   using RecvDevice = fon9::io::IocpDgram;
 #else
    #include "fon9/io/FdrDgram.hpp"
    #include "fon9/io/FdrServiceEpoll.hpp"
+   namespace fon9 { namespace io {
+   class FdrSocketRecvFrom : public FdrDgramImpl {
+      fon9_NON_COPY_NON_MOVE(FdrSocketRecvFrom);
+      using base = FdrDgramImpl;
+      SocketAddress  RecvFromAddr_;
+      socklen_t      RecvFromAddrLen_;
+      char           Padding____[8-sizeof(socklen_t)];
+   protected:
+      void OnFdrEvent_Handling(FdrEventFlag evs) override;
+   public:
+      using OwnerDevice = DgramT<FdrServiceSP, FdrSocketRecvFrom>;
+      FdrSocketRecvFrom(OwnerDevice* owner, Socket&& so, SocketResult& soRes)
+         : base(reinterpret_cast<base::OwnerDevice*>(owner), std::move(so), soRes) {
+      }
+      const SocketAddress& GetRecvFromAddr() const {
+         return this->RecvFromAddr_;
+      }
+      bool CheckRead(Device& dev, bool (*fnIsRecvBufferAlive)(Device& dev, RecvBuffer& rbuf));
+   };
+   using FdrDgramRecvFromBase = DeviceImpl_DeviceStartSend<FdrSocketRecvFrom::OwnerDevice, FdrSocketRecvFrom>;
+
+   class FdrDgramRecvFrom : public FdrDgramRecvFromBase {
+      fon9_NON_COPY_NON_MOVE(FdrDgramRecvFrom);
+      using base = FdrDgramRecvFromBase;
+   public:
+      using base::base;
+      const SocketAddress& GetRecvFromAddr() const {
+         return this->ImplSP_->GetRecvFromAddr();
+      }
+   };
+   //--------------------------------------------------------------------------//
+   void FdrSocketRecvFrom::OnFdrEvent_Handling(FdrEventFlag evs) {
+      FdrEventProcessor(this, *this->Owner_, evs);
+   }
+   bool FdrSocketRecvFrom::CheckRead(Device& dev, bool (*fnIsRecvBufferAlive)(Device& dev, RecvBuffer& rbuf)) {
+      size_t   totrd = 0;
+      if (fon9_LIKELY(this->RecvSize_ >= RecvBufferSize::Default)) {
+         for (;;) {
+            size_t expectSize = (this->RecvSize_ == RecvBufferSize::Default
+                                 ? 1024 * 4
+                                 : static_cast<size_t>(this->RecvSize_));
+            if (expectSize < 64)
+               expectSize = 64;
+
+            struct iovec   bufv[2];
+            bufv[1].iov_len = 0;
+
+            size_t   bufCount = this->RecvBuffer_.GetRecvBlockVector(bufv, expectSize);
+            (void)bufCount;
+
+            this->RecvFromAddrLen_ = sizeof(this->RecvFromAddr_.Addr_);
+            ssize_t  bytesTransfered = recvfrom(this->GetFD(), bufv[0].iov_base, bufv[0].iov_len, 0,
+                                                &this->RecvFromAddr_.Addr_, &this->RecvFromAddrLen_);
+            if (fon9_LIKELY(bytesTransfered > 0)) {
+               DcQueueList&   rxbuf = this->RecvBuffer_.SetDataReceived(bytesTransfered);
+
+               struct RecvAux : public FdrRecvAux {
+                  bool (*FnIsRecvBufferAlive_)(Device& dev, RecvBuffer& rbuf);
+                  bool IsRecvBufferAlive(Device& dev, RecvBuffer& rbuf) const {
+                     return this->FnIsRecvBufferAlive_ == nullptr || this->FnIsRecvBufferAlive_(dev, rbuf);
+                  }
+               };
+               RecvAux aux;
+               aux.FnIsRecvBufferAlive_ = fnIsRecvBufferAlive;
+               DeviceRecvBufferReady(dev, rxbuf, aux);
+
+               // 實際取出的資料量, 比要求取出的少 => 資料已全部取出, 所以結束 Recv.
+               if (fon9_LIKELY(static_cast<size_t>(bytesTransfered) < (bufv[0].iov_len + bufv[1].iov_len)))
+                  return true;
+
+               // 避免一次占用太久, 所以先結束.
+               if ((totrd += bytesTransfered) > 1024 * 256)
+                  return true;
+
+               // 關閉 readable 偵測: 需要到 op thread 處理 Recv 事件, 所以結束 Recv.
+               // 再根據 OnDevice_Recv() 事件處理結果, 決定是否重新啟用 readable 偵測.
+               if (fon9_UNLIKELY(aux.IsNeedsUpdateFdrEvent_))
+                  return true;
+
+               // Session 決定不要再處理 OnDevice_Recv() 事件, 所以拋棄全部已收到的資料.
+               if (fon9_UNLIKELY(this->RecvSize_ < RecvBufferSize::Default))
+                  goto __DROP_RECV;
+            }
+            else if (bytesTransfered < 0)
+               goto __READ_ERROR;
+            else
+               break;
+      } // for (;;) readv();
+   }
+      else {
+      __DROP_RECV:
+         this->RecvBuffer_.Clear();
+         char  buf[1024 * 256];
+         for (;;) {
+            ssize_t  rdsz = read(this->GetFD(), buf, sizeof(buf));
+            if (rdsz < 0)
+               goto __READ_ERROR;
+            if (rdsz == 0)
+               break;
+            totrd += rdsz;
+         }
+      }
+      if (totrd > 0)
+         return true;
+      //  read() == 0: disconnect.
+      this->SocketError("Recv", 0);
+      return false;
+
+   __READ_ERROR:
+      if (int eno = ErrorCannotRetry(errno)) {
+         this->SocketError("Recv", eno);
+         return false;
+      }
+      return true;
+   }
+   } } // namespaces
+
+   using RecvDevice = fon9::io::FdrDgramRecvFrom;
    using IoService = fon9::io::FdrServiceEpoll;
    using IoServiceSP = fon9::io::FdrServiceSP;
-   using RecvDevice = fon9::io::FdrDgram;
 #endif
-
 //--------------------------------------------------------------------------//
 #define kMAX_PK_SIZE    2048
 // 格式參考 https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#packet-data
@@ -66,7 +289,7 @@ typedef struct f9epbc_RxPkHeader {
    uint64_t    TTS_;        // tick time stamp.  \.
    uint32_t    PkBytes_;    //                    | hdr: f9epbc_kRXPK_HEAD_SIZE = 16 bytes.
    uint16_t    PkBadCount_; //                    |
-   uint8_t     Padding2b_[2];//                  /  封包序號(暫時提供給debug用:gPkSeqNext)
+   uint16_t    Padding2b_;  //                  /  封包序號(暫時提供給debug用:gPkSeqNext)
    uint8_t     Payload_[1]; // 實際 Payload_ 的大小 = PkBytes_;
 
    void AdjustEndian() {
@@ -104,16 +327,22 @@ static inline fon9::TimeStamp TimeStampFromNS(uint64_t ns) {
 static inline fon9::TimeStamp GetPkTimeStamp(const f9epbc_RxPkHeader& pkHdr) {
    return TimeStampFromNS(CalcPkTimeStampNS(pkHdr));
 }
-
+//--------------------------------------------------------------------------//
 class F9pcapDumpSession : public fon9::io::Session {
    fon9_NON_COPY_NON_MOVE(F9pcapDumpSession);
    using base = fon9::io::Session;
    uint64_t PcapCount_{};
    uint64_t RxEvCount_{};
+   bool     IsCapPortSrcMAC_;
+   char     Padding_____[7];
 
 public:
-   F9pcapDumpSession() = default;
+   F9pcapDumpSession(bool isCapPortSrcMAC) : IsCapPortSrcMAC_{isCapPortSrcMAC} {
+   }
 
+   uint64_t PcapCount() const {
+      return this->PcapCount_;
+   }
    void OnDevice_StateChanged(fon9::io::Device&, const fon9::io::StateChangedArgs& e) override {
       if (e.BeforeState_ == fon9::io::State::LinkReady)
          this->FlushPcapRec();
@@ -122,7 +351,10 @@ public:
       dev.CommonTimerRunAfter(gFlushPcapInterval);
       return static_cast<fon9::io::RecvBufferSize>(kMAX_PK_SIZE);
    }
-   fon9::io::RecvBufferSize OnDevice_Recv(fon9::io::Device&, fon9::DcQueue& rxbuf) override {
+   fon9::io::RecvBufferSize OnDevice_Recv(fon9::io::Device& dev, fon9::DcQueue& rxbuf) override {
+      // char strFrom[128];
+      // static_cast<RecvDevice*>(&dev)->GetRecvFromAddr().ToAddrPortStr(strFrom);
+      // printf("From:%s\n", strFrom);
       ++this->RxEvCount_;
       f9epbc_RxPkHeader  pkHdr;
       static const auto  kPkHdrSize = sizeof(pkHdr) - sizeof(pkHdr.Payload_);
@@ -134,7 +366,7 @@ public:
             // Windows 很奇怪, 用 Wireshark 抓包, 明明封包沒遺失, 也沒亂序;
             // 但是這裡收到的封包, 就是會有遺失或亂序?!
             // Linux 就沒有此問題!
-            uint16_t pkseq = *reinterpret_cast<const uint16_t*>(pkHdr.Padding2b_);
+            uint16_t pkseq = pkHdr.Padding2b_;
             if (fon9_UNLIKELY(pkseq != gPkSeqNext)) {
                // 僅測試用, 所以沒考慮 overflow;
                if (gPkSeqNext < pkseq) {
@@ -202,6 +434,11 @@ public:
          prec->incl_len = pkHdr.PkBytes_;
          prec->orig_len = prec->incl_len;
          rxbuf.Read(prec->packet_buffer, prec->incl_len);
+         if (this->IsCapPortSrcMAC_) {
+            uint16_t srcPort = static_cast<RecvDevice*>(&dev)->GetRecvFromAddr().GetPort();
+            // 抓包設備 port0 使用 SrcIp:2000 送出; port1 使用 SrcIp:2001 送出; ...之後類推;
+            prec->packet_buffer[11] = static_cast<uint8_t>(srcPort - 2000);
+         }
          gPcapList.Lock()->insert(std::move(prec));
          ++this->PcapCount_;
       }
@@ -276,7 +513,7 @@ int main(int argc, const char** argv) {
    if (argc < 4) {
       puts(R"**(
 Usage:
-   outfile filemode "DeviceConfig"
+   outfile filemode "DeviceConfig" [--CapPortSrcMAC]
 
    filemode:
       - w = Write
@@ -284,6 +521,12 @@ Usage:
       - o = OpenAlways
       - c = CreatePath
       - n = MustNew
+
+   --CapPortSrcMAC
+     Store [cap device port] to ethernet frame [source MAC address].
+
+   -l seconds
+     linger quit seconds.
 
 e.g.
     dumpout.pcap ca "Group=225.6.6.6|Bind=22566"
@@ -293,23 +536,20 @@ e.g.
 
    fon9::PresetDefaultThreadPoolValues(1, fon9::TimeInterval{});
 
+   uint32_t       lingerQuitSecs = 0;
    std::string    outfname = argv[1];
    fon9::FileMode fmode = fon9::StrToFileMode(fon9::StrView_cstr(argv[2]));
    const char*    devArgs = argv[3];
-   const char**   pArgs = argv + 4;
-   while (const char* exArg = *pArgs) {
-      ++pArgs;
-      switch (exArg[0]) {
-      case '-':
-      case '/':
-         switch (exArg[1]) {
-         case 'L':
-            gIsCheckLost = true;
-            break;
-         }
-         break;
-      }
+
+   fon9::StrView  argstr;
+   // linger quit seconds.
+   argstr = fon9::GetCmdArg(argc, argv, "l", nullptr);
+   if (!argstr.IsNull()) {
+      lingerQuitSecs = fon9::StrTo(argstr, 1u);
    }
+   // -L check lost(for debug)
+   gIsCheckLost = !fon9::GetCmdArg(argc, argv, "L", nullptr).IsNull();
+   const bool isCapPortSrcMAC = !fon9::GetCmdArg(argc, argv, nullptr, "CapPortSrcMAC").IsNull();
 
    fon9::io::IoServiceArgs iosvArgs;
    fon9::RevBufferList     rbuf{1024};
@@ -343,7 +583,7 @@ e.g.
    }
 
    fon9::io::ManagerCSP mgr{new fon9::io::SimpleManager{}};
-   F9pcapDumpSessionSP  ses{new F9pcapDumpSession{}};
+   F9pcapDumpSessionSP  ses{new F9pcapDumpSession{isCapPortSrcMAC}};
    fon9::io::DeviceSP   dev{new RecvDevice(iosv, ses, mgr)};
 
    dev->Initialize();
@@ -353,7 +593,7 @@ e.g.
 
    puts("'?' or 'help' for command list.");
    char cmdbuf[1024];
-   while (fon9_AppBreakMsg == NULL) {
+   while (fon9_AppBreakMsg == nullptr) {
       printf("> ");
       fflush(stdout);
       if (!fgets(cmdbuf, sizeof(cmdbuf), stdin))
@@ -393,8 +633,32 @@ Commands:
             fon9::LogLevel_ = static_cast<fon9::LogLevel>(fon9::StrTo(cmdln, 0u));
          puts(fon9::RevPrintTo<std::string>("LogLevel=", fon9::GetLevelStr(fon9::LogLevel_)).c_str());
       }
+      else if (c1 == "lq") {
+         if ((lingerQuitSecs = fon9::StrTo(cmdln, lingerQuitSecs)) <= 0)
+            lingerQuitSecs = 1;
+         break;
+      }
    }
-   ses->FlushPcapRec();
+   if (lingerQuitSecs > 0) {
+      fon9_AppBreakMsg = nullptr;
+      // 由於使用 1G(100M) 接收抓包結果, 所以在瞬間大量測試完畢後, 可能尚未全部收完抓包訊息.
+      // 因此在此等候一段時間, 確定沒有任何訊息了, 才結束程式.
+      printf("Linger:%u secs\n", lingerQuitSecs);
+      uint32_t lcount = 0;
+      while (fon9_AppBreakMsg == nullptr) {
+         const auto pcount = ses->PcapCount();
+         printf("\r" "Linger(%u): %" PRIu64 ". ", lingerQuitSecs - lcount, ses->PcapCount());
+         std::this_thread::sleep_for(std::chrono::milliseconds{1000});
+         if (pcount == ses->PcapCount()) {
+            if (++lcount >= lingerQuitSecs)
+               break;
+            continue;
+         }
+         lcount = 0;
+      }
+      printf("\r%-40s\n", fon9_AppBreakMsg ? fon9_AppBreakMsg : "");
+   }
+   ses->PrintInfo(true);
    dev->AsyncDispose("quit");
    dev->WaitGetDeviceInfo(); // 等候 dev->AsyncDispose("quit") 執行完畢.
    // wait all AcceptedClient dispose

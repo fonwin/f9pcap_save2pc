@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 14
+VisualStudioVersion = 14.0.25420.1
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "libfon9", "..\..\..\fon9\build\vs2015\libfon9\libfon9.vcxproj", "{6B9031A7-02E1-4171-8CA5-9F780BE21806}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "f9pcap4mcast", "f9pcap4mcast\f9pcap4mcast.vcxproj", "{1A936E13-F5BA-41C8-A05E-FDBE71FE823A}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6B9031A7-02E1-4171-8CA5-9F780BE21806}.Debug|x64.ActiveCfg = Debug|x64
+		{6B9031A7-02E1-4171-8CA5-9F780BE21806}.Debug|x64.Build.0 = Debug|x64
+		{6B9031A7-02E1-4171-8CA5-9F780BE21806}.Release|x64.ActiveCfg = Release|x64
+		{6B9031A7-02E1-4171-8CA5-9F780BE21806}.Release|x64.Build.0 = Release|x64
+		{1A936E13-F5BA-41C8-A05E-FDBE71FE823A}.Debug|x64.ActiveCfg = Debug|x64
+		{1A936E13-F5BA-41C8-A05E-FDBE71FE823A}.Debug|x64.Build.0 = Debug|x64
+		{1A936E13-F5BA-41C8-A05E-FDBE71FE823A}.Release|x64.ActiveCfg = Release|x64
+		{1A936E13-F5BA-41C8-A05E-FDBE71FE823A}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal

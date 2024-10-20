@@ -15,7 +15,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\f9pcap4mcast.cpp">
+    <ClCompile Include="..\..\..\f9pcap4mcast.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
